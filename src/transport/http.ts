@@ -1,31 +1,33 @@
 /**
  * HTTP and SSE Transport Implementation for MCP Server
- * Modern implementation with proper CORS, error handling, and security
+ * Wires the MCP SDK server to real request handling via StreamableHTTPServerTransport
  */
 
 import express, { Request, Response } from 'express';
 import cors from 'cors';
+import { randomUUID } from 'node:crypto';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 
 /**
- * HTTP Transport Server
- * Provides REST-like interface for MCP server functionality
+ * HTTP Transport Server (Streamable HTTP - recommended, replaces SSE)
  */
 export async function createHttpServer(mcpServer: Server, port: number): Promise<void> {
   const app = express();
 
-  // Security and parsing middleware
   app.use(cors({
     origin: process.env.CORS_ORIGIN || '*',
     credentials: true,
-    methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
+    methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Mcp-Session-Id']
   }));
 
   app.use(express.json({ limit: '10mb' }));
-  app.use(express.urlencoded({ extended: true }));
 
-  // Health check endpoint
+  // Map of active sessions, keyed by Mcp-Session-Id
+  const transports: Record<string, StreamableHTTPServerTransport> = {};
+
   app.get('/health', (req: Request, res: Response) => {
     res.json({
       status: 'healthy',
@@ -36,26 +38,76 @@ export async function createHttpServer(mcpServer: Server, port: number): Promise
     });
   });
 
-  // Server info endpoint
   app.get('/info', (req: Request, res: Response) => {
     res.json({
       name: 'ninjaone-mcp-server',
       version: '1.2.0',
       description: 'NinjaONE RMM MCP Server with HTTP transport',
-      capabilities: {
-        tools: true,
-        resources: false,
-        prompts: false,
-        logging: true
-      },
+      capabilities: { tools: true, resources: false, prompts: false, logging: true },
       transports: ['stdio', 'http', 'sse']
     });
   });
 
-  // Tools listing endpoint (REST-style convenience)
+  // Real MCP endpoint — this is what Claude.ai actually calls
+  app.post('/mcp', async (req: Request, res: Response) => {
+    try {
+      const sessionId = req.headers['mcp-session-id'] as string | undefined;
+      let transport: StreamableHTTPServerTransport;
+
+      if (sessionId && transports[sessionId]) {
+        transport = transports[sessionId];
+      } else {
+        transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => randomUUID(),
+          onsessioninitialized: (sid) => {
+            transports[sid] = transport;
+          }
+        });
+
+        transport.onclose = () => {
+          if (transport.sessionId) delete transports[transport.sessionId];
+        };
+
+        await mcpServer.connect(transport as any);
+      }
+
+      await transport.handleRequest(req, res, req.body);
+    } catch (error) {
+      console.error('MCP POST error:', error);
+      if (!res.headersSent) {
+        res.status(500).json({
+          jsonrpc: '2.0',
+          error: { code: -32603, message: error instanceof Error ? error.message : 'Internal error' },
+          id: null
+        });
+      }
+    }
+  });
+
+  // Session resumption / server-to-client stream
+  app.get('/mcp', async (req: Request, res: Response) => {
+    const sessionId = req.headers['mcp-session-id'] as string | undefined;
+    if (!sessionId || !transports[sessionId]) {
+      res.status(400).send('Invalid or missing session ID');
+      return;
+    }
+    await transports[sessionId].handleRequest(req, res);
+  });
+
+  // Session termination
+  app.delete('/mcp', async (req: Request, res: Response) => {
+    const sessionId = req.headers['mcp-session-id'] as string | undefined;
+    if (!sessionId || !transports[sessionId]) {
+      res.status(400).send('Invalid or missing session ID');
+      return;
+    }
+    await transports[sessionId].handleRequest(req, res);
+    delete transports[sessionId];
+  });
+
+  // Kept for convenience/debugging only — not used by Claude.ai
   app.get('/tools', async (req: Request, res: Response) => {
     try {
-      // Simplified response for now
       res.json({
         tools: [
           { name: 'get_devices', description: 'List all devices' },
@@ -69,32 +121,20 @@ export async function createHttpServer(mcpServer: Server, port: number): Promise
       });
     } catch (error) {
       console.error('Tools endpoint error:', error);
-      res.status(500).json({
-        error: 'Failed to retrieve tools',
-        message: error instanceof Error ? error.message : 'Unknown error'
-      });
+      res.status(500).json({ error: 'Failed to retrieve tools', message: error instanceof Error ? error.message : 'Unknown error' });
     }
   });
 
-  // Error handling middleware
   app.use((error: any, req: Request, res: Response, next: any) => {
     console.error('Express error:', error);
-    res.status(500).json({
-      error: 'Internal server error',
-      message: error.message || 'Unknown error occurred'
-    });
+    res.status(500).json({ error: 'Internal server error', message: error.message || 'Unknown error occurred' });
   });
 
-  // 404 handler
   app.use((req: Request, res: Response) => {
     res.status(404).json({
       error: 'Not found',
       message: `Route ${req.method} ${req.path} not found`,
-      availableEndpoints: [
-        'GET /health',
-        'GET /info', 
-        'GET /tools'
-      ]
+      availableEndpoints: ['GET /health', 'GET /info', 'GET /tools', 'POST /mcp', 'GET /mcp', 'DELETE /mcp']
     });
   });
 
@@ -103,7 +143,6 @@ export async function createHttpServer(mcpServer: Server, port: number): Promise
       console.error(`HTTP server listening on port ${port}`);
       resolve();
     });
-
     server.on('error', (error) => {
       console.error('HTTP server error:', error);
       reject(error);
@@ -112,13 +151,11 @@ export async function createHttpServer(mcpServer: Server, port: number): Promise
 }
 
 /**
- * Server-Sent Events (SSE) Transport Server
- * Provides real-time streaming interface for MCP server
+ * Legacy SSE Transport Server (deprecated by MCP spec — prefer createHttpServer above)
  */
 export async function createSseServer(mcpServer: Server, port: number): Promise<void> {
   const app = express();
 
-  // Security and parsing middleware
   app.use(cors({
     origin: process.env.CORS_ORIGIN || '*',
     credentials: true,
@@ -128,7 +165,8 @@ export async function createSseServer(mcpServer: Server, port: number): Promise<
 
   app.use(express.json({ limit: '10mb' }));
 
-  // Health check
+  const transports: Record<string, SSEServerTransport> = {};
+
   app.get('/health', (req: Request, res: Response) => {
     res.json({
       status: 'healthy',
@@ -139,40 +177,25 @@ export async function createSseServer(mcpServer: Server, port: number): Promise<
     });
   });
 
-  // SSE endpoint for real-time communication
   app.get('/events', async (req: Request, res: Response) => {
-    // Set SSE headers
-    res.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive',
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Headers': 'Cache-Control'
+    const transport = new SSEServerTransport('/message', res);
+    transports[transport.sessionId] = transport;
+
+    res.on('close', () => {
+      delete transports[transport.sessionId];
     });
 
-    // Send initial connection event
-    res.write(`data: ${JSON.stringify({
-      type: 'connected',
-      timestamp: new Date().toISOString(),
-      server: 'ninjaone-mcp-server'
-    })}\n\n`);
+    await mcpServer.connect(transport);
+  });
 
-    // Handle client disconnect
-    req.on('close', () => {
-      console.error('SSE client disconnected');
-    });
-
-    // Keep connection alive with periodic heartbeat
-    const heartbeat = setInterval(() => {
-      res.write(`data: ${JSON.stringify({
-        type: 'heartbeat',
-        timestamp: new Date().toISOString()
-      })}\n\n`);
-    }, 30000); // 30 second heartbeat
-
-    req.on('close', () => {
-      clearInterval(heartbeat);
-    });
+  app.post('/message', async (req: Request, res: Response) => {
+    const sessionId = req.query.sessionId as string;
+    const transport = transports[sessionId];
+    if (!transport) {
+      res.status(400).send('No transport found for sessionId');
+      return;
+    }
+    await transport.handlePostMessage(req, res, req.body);
   });
 
   return new Promise<void>((resolve, reject) => {
@@ -180,7 +203,6 @@ export async function createSseServer(mcpServer: Server, port: number): Promise<
       console.error(`SSE server listening on port ${port}`);
       resolve();
     });
-
     server.on('error', (error) => {
       console.error('SSE server error:', error);
       reject(error);

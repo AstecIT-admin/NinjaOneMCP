@@ -9,7 +9,7 @@ config();
 
 const REDIRECT_PORT = 8765;
 const REDIRECT_PATH = '/callback';
-const REDIRECT_URI = `http://localhost:${REDIRECT_PORT}${REDIRECT_PATH}`;
+const REDIRECT_URI = `https://localhost:${REDIRECT_PORT}${REDIRECT_PATH}`;
 const SCOPES = 'monitoring management control offline_access';
 
 const REGION_MAP: Record<string, string> = {
