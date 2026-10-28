@@ -7,7 +7,7 @@
   "scripts": {
     "build": "echo Build skipped, using pre-built dist",
     "dev": "tsc --watch",
-    "start": "npx -y supergateway --stdio \"node dist/index.js\" --port 8080",
+    "start": "MCP_MODE=http node dist/index.js",
     "start:stdio": "MCP_MODE=stdio node dist/index.js",
     "start:http": "MCP_MODE=http node dist/index.js",
     "start:sse": "MCP_MODE=sse node dist/index.js",
