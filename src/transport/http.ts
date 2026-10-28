@@ -58,7 +58,6 @@ export async function createHttpServer(createServer: ServerFactory, port: number
       // Extract the bearer token Claude.ai sends for the signed-in user (Authorization: Bearer <token>)
       const authHeader = req.headers['authorization'] as string | undefined;
       const incomingToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : undefined;
-      console.error('DEBUG - Authorization header present:', !!authHeader, '| Incoming token (first 20 chars):', incomingToken?.slice(0, 20) || 'NONE');
       const sessionId = req.headers['mcp-session-id'] as string | undefined;
       let transport: StreamableHTTPServerTransport;
 
