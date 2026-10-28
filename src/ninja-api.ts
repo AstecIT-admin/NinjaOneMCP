@@ -1,4 +1,5 @@
 import { UserOAuth } from './oauth-user.js';
+import { getIncomingToken } from './request-context.js';
 
 type CreateEndUserPayload = {
   firstName: string;
@@ -139,6 +140,11 @@ export class NinjaOneAPI {
   }
 
   private async getBearerToken(): Promise<string> {
+        // If Claude.ai passed a real per-user NinjaOne token for this request, use it directly.
+    const incoming = getIncomingToken();
+    if (incoming) {
+      return incoming;
+    }
     // Prefer user-context token (authorization_code) when the user has run the auth CLI.
     // Falls back to client_credentials for unauthenticated reads.
     if (!this.userAuthChecked) {

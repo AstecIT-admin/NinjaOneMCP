@@ -1203,30 +1203,38 @@ class NinjaOneMCPServer {
   constructor() {
     try {
       this.api = new NinjaOneAPI();
-      this.server = new Server(
-        {
-          name: 'ninjaone-mcp-server',
-          version: '1.2.0',
-        },
-        {
-          capabilities: {
-            tools: {}
-          }
-        }
-      );
-      this.setupToolHandlers();
+      this.server = this.createServerInstance();
     } catch (error) {
       console.error('Failed to initialize NinjaONE MCP Server:', error);
       throw error;
     }
   }
 
-  private setupToolHandlers() {
-    this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  // Creates a brand-new Server instance with handlers wired up.
+  // The MCP SDK's Server can only be connected to ONE transport ever —
+  // so HTTP/SSE must call this fresh for every new session.
+  createServerInstance(): Server {
+    const server = new Server(
+      {
+        name: 'ninjaone-mcp-server',
+        version: '1.2.0',
+      },
+      {
+        capabilities: {
+          tools: {}
+        }
+      }
+    );
+    this.setupToolHandlers(server);
+    return server;
+  }
+
+  private setupToolHandlers(server: Server) {
+    server.setRequestHandler(ListToolsRequestSchema, async () => ({
       tools: TOOLS
     }));
 
-    this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { name, arguments: args } = request.params;
       try {
         console.error(`Executing tool: ${name}`);
@@ -1725,22 +1733,42 @@ class NinjaOneMCPServer {
   }
 
   private async searchDevicesByName(searchName: string, limit: number) {
-    const devices = await this.api.getDevices(undefined, 200);
-    const filtered = devices
-      .filter((device: any) =>
-        device.systemName?.toLowerCase().includes(searchName.toLowerCase()) ||
-        device.displayName?.toLowerCase().includes(searchName.toLowerCase())
-      )
-      .slice(0, limit)
-      .map((d: any) => ({
-        id: d.id,
-        systemName: d.systemName,
-        displayName: d.displayName,
-        nodeClass: d.nodeClass,
-        offline: d.offline,
-        organizationId: d.organizationId,
-        lastContact: d.lastContact
-      }));
+    // Page through ALL devices (cursor = last node ID from previous page) instead of
+    // only the first batch, so newer machines (higher IDs) are found too.
+    const needle = searchName.toLowerCase();
+    const matches: any[] = [];
+    const pageSize = 500;
+    const maxPages = 100; // safety cap
+    let after: number | undefined = undefined;
+
+    for (let page = 0; page < maxPages && matches.length < limit; page++) {
+      const batch: any[] = await this.api.getDevices(undefined, pageSize, after);
+      if (!Array.isArray(batch) || batch.length === 0) break;
+
+      for (const d of batch) {
+        if (
+          d.systemName?.toLowerCase().includes(needle) ||
+          d.displayName?.toLowerCase().includes(needle)
+        ) {
+          matches.push(d);
+          if (matches.length >= limit) break;
+        }
+      }
+
+      const lastId: number | undefined = batch[batch.length - 1]?.id;
+      if (lastId === undefined || lastId === after) break; // no progress, stop
+      after = lastId;
+    }
+
+    const filtered = matches.map((d: any) => ({
+      id: d.id,
+      systemName: d.systemName,
+      displayName: d.displayName,
+      nodeClass: d.nodeClass,
+      offline: d.offline,
+      organizationId: d.organizationId,
+      lastContact: d.lastContact
+    }));
 
     return {
       searchTerm: searchName,
@@ -1778,12 +1806,14 @@ class NinjaOneMCPServer {
   }
 
   async runHttp(port = 3000) {
-    await createHttpServer(this.server, port);
+    // Pass a factory, not a single server — each session needs its own Server instance,
+    // since the MCP SDK's Server can only ever be connected to one transport.
+    await createHttpServer(() => this.createServerInstance(), port);
     console.error(`NinjaONE MCP server running on HTTP transport at port ${port}`);
   }
 
   async runSse(port = 3001) {
-    await createSseServer(this.server, port);
+    await createSseServer(() => this.createServerInstance(), port);
     console.error(`NinjaONE MCP server running on SSE transport at port ${port}`);
   }
 }

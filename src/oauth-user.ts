@@ -9,7 +9,9 @@ export interface StoredTokens {
 }
 
 export class UserOAuth {
-  private static tokenDir = join(homedir(), '.ninjaone-mcp');
+  private static tokenDir = process.env.WEBSITE_INSTANCE_ID
+    ? '/home/data/.ninjaone-mcp'
+    : join(homedir(), '.ninjaone-mcp');
   private static tokenFile = join(UserOAuth.tokenDir, 'tokens.json');
 
   private cachedAccessToken: string | null = null;

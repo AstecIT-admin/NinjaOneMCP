@@ -1,7 +1,7 @@
 import { createServer } from 'http';
 import { spawn } from 'child_process';
 import { URL } from 'url';
-import { randomBytes } from 'crypto';
+import { randomBytes, createHash } from 'crypto';
 import { config } from 'dotenv';
 import { UserOAuth } from './oauth-user.js';
 
@@ -41,7 +41,11 @@ async function main() {
   if (!clientId || !clientSecret) throw new Error('NINJA_CLIENT_ID and NINJA_CLIENT_SECRET must be set.');
 
   const baseUrl = resolveBaseUrl();
-  const state = randomBytes(16).toString('hex');
+    const state = randomBytes(16).toString('hex');
+
+  // PKCE: NinjaOne's authorization server requires S256 code_challenge for this app type.
+  const codeVerifier = randomBytes(32).toString('base64url');
+  const codeChallenge = createHash('sha256').update(codeVerifier).digest('base64url');
 
   const authUrl = new URL(`${baseUrl}/ws/oauth/authorize`);
   authUrl.searchParams.set('response_type', 'code');
@@ -49,7 +53,8 @@ async function main() {
   authUrl.searchParams.set('redirect_uri', REDIRECT_URI);
   authUrl.searchParams.set('scope', SCOPES);
   authUrl.searchParams.set('state', state);
-
+  authUrl.searchParams.set('code_challenge', codeChallenge);
+  authUrl.searchParams.set('code_challenge_method', 'S256');
   const code: string = await new Promise((resolve, reject) => {
     const server = createServer((req, res) => {
       if (!req.url) return;
@@ -96,12 +101,13 @@ async function main() {
   });
 
   console.log('Exchanging code for tokens...');
-  const tokenBody = new URLSearchParams({
+    const tokenBody = new URLSearchParams({
     grant_type: 'authorization_code',
     code,
     redirect_uri: REDIRECT_URI,
     client_id: clientId,
-    client_secret: clientSecret
+    client_secret: clientSecret,
+    code_verifier: codeVerifier
   });
   const tokenResp = await fetch(`${baseUrl}/ws/oauth/token`, {
     method: 'POST',

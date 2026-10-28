@@ -1,6 +1,12 @@
 /**
  * HTTP and SSE Transport Implementation for MCP Server
  * Wires the MCP SDK server to real request handling via StreamableHTTPServerTransport
+ *
+ * IMPORTANT: Each session gets its OWN Server instance, created via the
+ * `createServer` factory passed in. The MCP SDK's Server can only ever be
+ * connected to one transport for its lifetime — sharing a single Server
+ * across sessions causes "Already connected to a transport" errors on the
+ * second and every subsequent session.
  */
 
 import express, { Request, Response } from 'express';
@@ -9,11 +15,11 @@ import { randomUUID } from 'node:crypto';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
+import { requestContext } from '../request-context.js';
 
-/**
- * HTTP Transport Server (Streamable HTTP - recommended, replaces SSE)
- */
-export async function createHttpServer(mcpServer: Server, port: number): Promise<void> {
+type ServerFactory = () => Server;
+
+export async function createHttpServer(createServer: ServerFactory, port: number): Promise<void> {
   const app = express();
 
   app.use(cors({
@@ -25,7 +31,6 @@ export async function createHttpServer(mcpServer: Server, port: number): Promise
 
   app.use(express.json({ limit: '10mb' }));
 
-  // Map of active sessions, keyed by Mcp-Session-Id
   const transports: Record<string, StreamableHTTPServerTransport> = {};
 
   app.get('/health', (req: Request, res: Response) => {
@@ -48,15 +53,20 @@ export async function createHttpServer(mcpServer: Server, port: number): Promise
     });
   });
 
-  // Real MCP endpoint — this is what Claude.ai actually calls
-  app.post('/mcp', async (req: Request, res: Response) => {
+    app.post('/mcp', async (req: Request, res: Response) => {
     try {
+      // Extract the bearer token Claude.ai sends for the signed-in user (Authorization: Bearer <token>)
+      const authHeader = req.headers['authorization'] as string | undefined;
+      const incomingToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : undefined;
+      console.error('DEBUG - Authorization header present:', !!authHeader, '| Incoming token (first 20 chars):', incomingToken?.slice(0, 20) || 'NONE');
       const sessionId = req.headers['mcp-session-id'] as string | undefined;
       let transport: StreamableHTTPServerTransport;
 
       if (sessionId && transports[sessionId]) {
         transport = transports[sessionId];
       } else {
+        const mcpServer = createServer();
+
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (sid) => {
@@ -71,7 +81,9 @@ export async function createHttpServer(mcpServer: Server, port: number): Promise
         await mcpServer.connect(transport as any);
       }
 
-      await transport.handleRequest(req, res, req.body);
+      await requestContext.run({ token: incomingToken }, async () => {
+        await transport.handleRequest(req, res, req.body);
+      });
     } catch (error) {
       console.error('MCP POST error:', error);
       if (!res.headersSent) {
@@ -84,7 +96,6 @@ export async function createHttpServer(mcpServer: Server, port: number): Promise
     }
   });
 
-  // Session resumption / server-to-client stream
   app.get('/mcp', async (req: Request, res: Response) => {
     const sessionId = req.headers['mcp-session-id'] as string | undefined;
     if (!sessionId || !transports[sessionId]) {
@@ -94,7 +105,6 @@ export async function createHttpServer(mcpServer: Server, port: number): Promise
     await transports[sessionId].handleRequest(req, res);
   });
 
-  // Session termination
   app.delete('/mcp', async (req: Request, res: Response) => {
     const sessionId = req.headers['mcp-session-id'] as string | undefined;
     if (!sessionId || !transports[sessionId]) {
@@ -105,7 +115,6 @@ export async function createHttpServer(mcpServer: Server, port: number): Promise
     delete transports[sessionId];
   });
 
-  // Kept for convenience/debugging only — not used by Claude.ai
   app.get('/tools', async (req: Request, res: Response) => {
     try {
       res.json({
@@ -150,10 +159,7 @@ export async function createHttpServer(mcpServer: Server, port: number): Promise
   });
 }
 
-/**
- * Legacy SSE Transport Server (deprecated by MCP spec — prefer createHttpServer above)
- */
-export async function createSseServer(mcpServer: Server, port: number): Promise<void> {
+export async function createSseServer(createServer: ServerFactory, port: number): Promise<void> {
   const app = express();
 
   app.use(cors({
@@ -178,6 +184,8 @@ export async function createSseServer(mcpServer: Server, port: number): Promise<
   });
 
   app.get('/events', async (req: Request, res: Response) => {
+    const mcpServer = createServer();
+
     const transport = new SSEServerTransport('/message', res);
     transports[transport.sessionId] = transport;
 
